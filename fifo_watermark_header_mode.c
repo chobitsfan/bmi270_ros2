@@ -13,6 +13,7 @@
 #include <math.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
+#include <time.h>
 #include "bmi2.h"
 #include "bmi270.h"
 
@@ -46,7 +47,6 @@
 
 /******************************************************************************/
 /*!                        Global Variables                                   */
-
 /* To read sensortime, extra 3 bytes are added to fifo buffer */
 uint16_t fifo_buffer_size = BMI2_FIFO_RAW_DATA_BUFFER_SIZE + SENSORTIME_OVERHEAD_BYTE;
 
@@ -83,14 +83,14 @@ int8_t bmi2_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_p
 
 int8_t bmi2_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
     int fd = *(int *)intf_ptr;
-    uint8_t buf[len + 1];
+    uint8_t buf[128];
     buf[0] = reg_addr;
     memcpy(&buf[1], data, len);
     if (write(fd, buf, len + 1) != (int)(len + 1)) return BMI2_E_COM_FAIL;
     return BMI2_OK;
 }
 
-void bmi2_delay_us(uint32_t period, void*) {
+void bmi2_delay_us(uint32_t period, void* intf_ptr) {
     usleep(period);
 }
 
@@ -102,7 +102,6 @@ void bmi2_error_codes_print_result(int8_t rslt)
     switch (rslt)
     {
         case BMI2_OK:
-
             /* Do nothing */
             break;
 
@@ -307,8 +306,6 @@ int main(void)
 
     uint16_t gyro_frame_length;
 
-    uint8_t try = 1;
-
     /* Sensor initialization configuration. */
     struct bmi2_dev bmi2_dev;
 
@@ -327,7 +324,7 @@ int main(void)
     if (i2c_fd < 0 || ioctl(i2c_fd, I2C_SLAVE, 0x68) < 0) {
         printf("can not open i2c\n");
         return 0;
-    }
+    } else printf("i2c ok\n");
 
     bmi2_dev.intf = BMI2_I2C_INTF;
     bmi2_dev.intf_ptr = &i2c_fd;
@@ -335,6 +332,7 @@ int main(void)
     bmi2_dev.write = bmi2_i2c_write;
     bmi2_dev.delay_us = bmi2_delay_us;
     bmi2_dev.read_write_len = 32;
+    bmi2_dev.config_file_ptr = NULL;
 
     /* Initialize bmi270. */
     rslt = bmi270_init(&bmi2_dev);
@@ -391,7 +389,22 @@ int main(void)
     float acc_scale = (4.0f * 9.80665f) / 32768.0f; // Scale factor for +/-4G range (m/s^2 per LSB)
     float gyro_scale = (2000.0f / 32768.0f) * (M_PI / 180.0f); // Scale factor for +/-2000 dps range (rad/s per LSB)
 
-    while (try <= 10)
+    struct timespec tp;
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    int64_t local_ns = tp.tv_sec * 1000000000 + tp.tv_nsec;
+    uint8_t sensortime_raw[3] = { 0 };
+    rslt = bmi2_get_regs(BMI2_CHIP_ID_ADDR, sensortime_raw, 3, &bmi2_dev);
+    int64_t time_offset_ns = 0;
+    if (rslt == BMI2_OK) {
+        uint32_t sensortime = 0;
+        sensortime = (uint32_t)sensortime_raw[0] | ((uint32_t)sensortime_raw[1] << 8) | ((uint32_t)sensortime_raw[2] << 16);
+        //printf("sensor time (s) %f\n", sensortime * BMI2_SENSORTIME_RESOLUTION);
+        int64_t sensortime_ns = sensortime * 39062.5;
+        printf("local_ns / sensortime_ns: %ld / %ld\n", local_ns, sensortime_ns);
+        time_offset_ns = local_ns - sensortime_ns;
+    }
+
+    while (1)
     {
         /* Read FIFO data on interrupt. */
         rslt = bmi2_get_int_status(&int_status, &bmi2_dev);
@@ -400,8 +413,6 @@ int main(void)
         /* To check the status of FIFO watermark interrupt. */
         if ((rslt == BMI2_OK) && (int_status & BMI2_FWM_INT_STATUS_MASK))
         {
-            printf("\nIteration : %d\n", try);
-
             rslt = bmi2_get_fifo_wm(&watermark, &bmi2_dev);
             bmi2_error_codes_print_result(rslt);
             printf("\nFIFO watermark level : %d\n", watermark);
@@ -468,8 +479,6 @@ int main(void)
                 /* Print control frames like sensor time and skipped frame count. */
                 printf("Skipped frame count = %d\n", fifoframe.skipped_frame_count);
                 printf("Sensor time(in seconds) = %.4lf  s\r\n", (fifoframe.sensor_time * BMI2_SENSORTIME_RESOLUTION));
-
-                try++;
             }
         }
     }
